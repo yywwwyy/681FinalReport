@@ -1,0 +1,639 @@
+---
+title: '4.13'
+author: "WYY"
+date: "2025-04-13"
+output:
+  html_document: default
+---
+
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(glmmTMB)
+imap1_data <- read_csv('cleaned_data-4-11.csv')
+
+
+# 4. Inspect
+str(imap1_data)
+head(imap1_data)
+imap1_data <- as.data.frame(imap1_data)
+```
+
+```{r}
+imap1_data
+```
+
+
+```{r}
+convert_to_long <- function(df) {
+  # Step 3a: Extract baseline MRP (MRP_0) and rename it
+  baseline_df <- df %>%
+    dplyr::select(ID, MRP_0) %>%
+    rename(baseline_MRP = MRP_0)
+  
+  # Step 3b: Pivot only the follow-up columns (MRP_6 and MRP_12) to long format
+  followup_data <- df %>%
+    pivot_longer(
+      cols = c(MRP_6, MRP_12),
+      names_to = "Time",
+      values_to = "MRP"
+    ) %>%
+    mutate(
+      Time = case_when(
+        Time == "MRP_6" ~ "6M",
+        Time == "MRP_12" ~ "12M"
+      ),
+      Time = factor(Time, levels = c("6M", "12M")),
+      Intervention = factor(Treatment, levels = c("Standard Care", "iMAP")),
+      race = factor(race),
+      #race = recode(race),
+      site = factor(site)
+    )
+  
+  # Step 3c: Join the baseline measurement to each follow-up row
+  data_long <- followup_data %>%
+    left_join(baseline_df, by = "ID")
+  
+  return(data_long)
+}
+```
+
+```{r}
+data_long <- convert_to_long(imap1_data)
+str(data_long)
+```
+
+
+primary analysis
+```{r}
+library(dplyr)
+library(lme4)
+library(DHARMa)
+
+```
+
+
+
+
+## zero—inflated poisson
+```{r}
+# 2. Fit the zero-inflated Poisson GLMM
+model_zip_time <- glmmTMB(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + (1 | ID),
+  data      = data_long,
+  family    = poisson(link = "log"),
+  ziformula = ~ Intervention*Time +baseline_MRP +race + site      # zero-inflation
+)
+
+# 3. Summarize the model
+summary(model_zip_time)
+
+# 4. Simulate residuals via DHARMa
+sim_zip <- simulateResiduals(fittedModel = model_zip_time, n = 1000)
+
+# 5. Plot diagnostics
+plot(sim_zip)
+
+# 6. Test dispersion
+testDispersion(sim_zip)
+```
+
+## generalized poisson
+```{r}
+# 2. Fit the zero-inflated Poisson GLMM
+model_gp <- glmmTMB(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + (1 | ID),
+  data      = data_long,
+  family    = genpois
+)
+
+# 3. Summarize the model
+summary(model_gp)
+
+# 4. Simulate residuals via DHARMa
+sim_zip <- simulateResiduals(fittedModel = model_gp, n = 1000)
+
+# 5. Plot diagnostics
+plot(sim_zip)
+
+# 6. Test dispersion
+testDispersion(sim_zip)
+```
+
+## CMP
+```{r}
+# 2. Fit the  Poisson GLMM
+model_cmp2 <- glmmTMB(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + (1 | ID),
+  data      = data_long,
+  family    = compois(link = "log"),
+  dispformula = ~ Intervention*Time +baseline_MRP +race + site
+)
+
+# 3. Summarize the model
+summary(model_cmp2)
+
+# 4. Simulate residuals via DHARMa
+sim_zip2 <- simulateResiduals(fittedModel = model_cmp2, n = 1000)
+
+# 5. Plot diagnostics
+plot(sim_zip2)
+
+# 6. Test dispersion
+testDispersion(sim_zip2)
+```
+
+```{r}
+# Extract conditional fixed effects and covariance
+fixef_vals <- fixef(model_cmp2)$cond
+cov_mat    <- vcov(model_cmp2)$cond
+
+beta0 <- fixef_vals["(Intercept)"]
+beta1 <- fixef_vals["InterventioniMAP"]
+beta2 <- fixef_vals["Time12M"]
+beta3 <- fixef_vals["InterventioniMAP:Time12M"]
+
+# critical value for 97.5% two-sided CI
+zcrit <- qnorm(0.9875)
+
+### 6‐Month Mean Difference: Δ6 = E[MRP_iMAP,6] − E[MRP_SC,6]
+# E[MRP_iMAP,6]  = exp(beta0 + beta1)
+# E[MRP_SC,6]    = exp(beta0)
+RD6   <- exp(beta0 + beta1) - exp(beta0)
+
+# gradient vector: partial derivation (beta0,beta1)
+grad6 <- c( exp(beta0 + beta1) - exp(beta0),
+            exp(beta0 + beta1) )
+
+cov6  <- cov_mat[c("(Intercept)", "InterventioniMAP"),
+                 c("(Intercept)", "InterventioniMAP")]
+
+var6  <- as.numeric(t(grad6) %*% cov6 %*% grad6)
+se6   <- sqrt(var6)
+
+CI6   <- RD6 + c(-1,1)*zcrit*se6
+Z6    <- RD6 / se6
+p6    <- 2 * pnorm(-abs(Z6))
+
+cat("6M Mean Difference (iMAP−SC):", RD6, "\n")
+cat("97.5% CI: (", CI6[1], ",", CI6[2], ")\n")
+cat("Wald Z:", Z6, "p-value:", p6, "\n\n")
+
+### 12‐Month Mean Difference: Δ12 = E[MRP_iMAP,12] − E[MRP_SC,12]
+# E[MRP_iMAP,12] = exp(beta0+beta2+beta1+beta3)
+# E[MRP_SC,12]   = exp(beta0+beta2)
+RD12  <- exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2)
+
+# gradient vector for (beta0,beta1,beta2,beta3)
+g12 <- c( exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2),
+          exp(beta0 + beta2 + beta1 + beta3),
+          exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2),
+          exp(beta0 + beta2 + beta1 + beta3) )
+
+cov12 <- cov_mat[
+  c("(Intercept)","InterventioniMAP","Time12M","InterventioniMAP:Time12M"),
+  c("(Intercept)","InterventioniMAP","Time12M","InterventioniMAP:Time12M")
+]
+
+var12  <- as.numeric(t(g12) %*% cov12 %*% g12)
+se12   <- sqrt(var12)
+
+CI12   <- RD12 + c(-1,1)*zcrit*se12
+Z12    <- RD12 / se12
+p12    <- 2 * pnorm(-abs(Z12))
+
+cat("12M Mean Difference (iMAP−SC):", RD12, "\n")
+cat("97.5% CI: (", CI12[1], ",", CI12[2], ")\n")
+cat("Wald Z:", Z12, "p-value:", p12, "\n")
+```
+
+```{r}
+library(ggplot2)
+
+# Create a tidy data.frame with point estimates and CIs
+df_rd <- data.frame(
+  Time      = c("6M",       "12M"),
+  Estimate  = c(RD6,        RD12),
+  Lower95   = c(CI6[1],     CI12[1]),
+  Upper95   = c(CI6[2],     CI12[2])
+)
+
+# Plot
+ggplot(df_rd, aes(x = Time, y = Estimate)) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_errorbar(aes(ymin = Lower95, ymax = Upper95),
+                width = 0.1, linewidth = 0.8, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkgray") +
+  labs(title = "Rate Difference (iMAP − SC) with 97.5% CI",
+       x     = "Follow-up Time",
+       y     = "Mean Difference in MRP") +
+  theme_minimal(base_size = 14)
+```
+
+
+
+
+```{r}
+# --- Extract fixed‐effect estimates and covariance matrix --- #
+fixef_vals <- fixef(model_cmp2)$cond
+cov_mat    <- vcov(model_cmp2)$cond
+
+beta1 <- fixef_vals["InterventioniMAP"]
+beta3 <- fixef_vals["InterventioniMAP:Time12M"]
+
+# critical value for 97.5% CI
+zcrit <- qnorm(0.9875)
+
+# --- 6‐Month Rate Ratio --- #
+RR6    <- exp(beta1)
+se_b1  <- sqrt(cov_mat["InterventioniMAP","InterventioniMAP"])
+
+# 97.5% CI on log‐scale:
+CI_log6 <- beta1 + c(-1,1)*zcrit*se_b1
+CI_RR6  <- exp(CI_log6)
+
+Z6  <- beta1 / se_b1
+p6  <- 2*pnorm(-abs(Z6))
+
+cat("6M Rate Ratio (iMAP vs SC):", RR6, "\n")
+cat("97.5% CI: (", CI_RR6[1], ",", CI_RR6[2], ")\n")
+cat("Wald Z =", Z6, "p =", p6, "\n\n")
+
+# --- 12‐Month Rate Ratio --- #
+log_RR12    <- beta1 + beta3
+RR12        <- exp(log_RR12)
+
+# Var(log_RR12) = Var(b1)+Var(b3)+2 Cov(b1,b3)
+var_log12   <- cov_mat["InterventioniMAP","InterventioniMAP"] +
+               cov_mat["InterventioniMAP:Time12M","InterventioniMAP:Time12M"] +
+               2*cov_mat["InterventioniMAP","InterventioniMAP:Time12M"]
+se_log12    <- sqrt(var_log12)
+
+# 97.5% CI on log‐scale:
+CI_log12    <- log_RR12 + c(-1,1)*zcrit*se_log12
+CI_RR12     <- exp(CI_log12)
+
+Z12  <- log_RR12 / se_log12
+p12  <- 2*pnorm(-abs(Z12))
+
+cat("12M Rate Ratio (iMAP vs SC):", RR12, "\n")
+cat("97.5% CI: (", CI_RR12[1], ",", CI_RR12[2], ")\n")
+cat("Wald Z =", Z12, "p =", p12, "\n")
+```
+
+```{r}
+
+# 1. Assemble results into a small data frame
+df_rr <- data.frame(
+  Time     = factor(c("6M", "12M"), levels = c("6M", "12M")),
+  RR       = c(RR6, RR12),
+  Lower    = c(CI_RR6[1], CI_RR12[1]),
+  Upper    = c(CI_RR6[2], CI_RR12[2])
+)
+
+# Quick check
+print(df_rr)
+#   Time   RR   Lower  Upper
+# 1   6M 0.46   0.27   0.75
+# 2  12M 0.54   0.32   0.91
+
+# 2. Plot
+ggplot(df_rr, aes(x = Time, y = RR)) +
+  geom_point(size = 3, color = "darkgreen") +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.1, color = "darkgreen") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+  scale_y_continuous(trans = "log10",  # if you like a log scale
+                     breaks    = c(0.25, 0.5, 1, 2, 4),
+                     labels    = c("0.25","0.5","1","2","4")) +
+  labs(
+    title    = "Rate Ratio of MRPs (iMAP vs. Standard Care)",
+    subtitle = "with 97.5% Wald confidence intervals",
+    x        = "Time Point",
+    y        = "Rate Ratio (iMAP / SC)"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+
+
+### senitivity analysis
+
+Primary
+6M Mean Difference (MRP_iMAP - MRP_SC): -0.2658475 
+95% CI for 6M Difference: ( -0.4589513 , -0.07274371 )
+Wald Z at 6M: -2.698347 
+p-value at 6M: 0.006968469 
+
+12M Mean Difference (MRP_iMAP - MRP_SC): -0.3865742 
+95% CI for 12M Difference: ( -0.6383851 , -0.1347633 )
+Wald Z at 12M: -3.008947 
+p-value at 12M: 0.002621551 
+
+
+```{r}
+model_cmp3_age <- glmmTMB(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + Age + (1 | ID),
+  data      = data_long,
+  family    = compois(link = "log"),
+  dispformula = ~ Intervention*Time +baseline_MRP +race + site
+)
+```
+
+
+```{r}
+# Extract conditional fixed effects and covariance
+fixef_vals <- fixef(model_cmp3_age)$cond
+cov_mat    <- vcov(model_cmp3_age)$cond
+
+beta0 <- fixef_vals["(Intercept)"]
+beta1 <- fixef_vals["InterventioniMAP"]
+beta2 <- fixef_vals["Time12M"]
+beta3 <- fixef_vals["InterventioniMAP:Time12M"]
+
+# critical value for 97.5% two-sided CI
+zcrit <- qnorm(0.9875)
+
+### 6‐Month Mean Difference: Δ6 = E[MRP_iMAP,6] − E[MRP_SC,6]
+# E[MRP_iMAP,6]  = exp(beta0 + beta1)
+# E[MRP_SC,6]    = exp(beta0)
+RD6   <- exp(beta0 + beta1) - exp(beta0)
+
+# gradient vector: partial derivation (beta0,beta1)
+grad6 <- c( exp(beta0 + beta1) - exp(beta0),
+            exp(beta0 + beta1) )
+
+cov6  <- cov_mat[c("(Intercept)", "InterventioniMAP"),
+                 c("(Intercept)", "InterventioniMAP")]
+
+var6  <- as.numeric(t(grad6) %*% cov6 %*% grad6)
+se6   <- sqrt(var6)
+
+CI6   <- RD6 + c(-1,1)*zcrit*se6
+Z6    <- RD6 / se6
+p6    <- 2 * pnorm(-abs(Z6))
+
+cat("6M Mean Difference (iMAP−SC):", RD6, "\n")
+cat("97.5% CI: (", CI6[1], ",", CI6[2], ")\n")
+cat("Wald Z:", Z6, "p-value:", p6, "\n\n")
+
+### 12‐Month Mean Difference: Δ12 = E[MRP_iMAP,12] − E[MRP_SC,12]
+# E[MRP_iMAP,12] = exp(beta0+beta2+beta1+beta3)
+# E[MRP_SC,12]   = exp(beta0+beta2)
+RD12  <- exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2)
+
+# gradient vector for (beta0,beta1,beta2,beta3)
+g12 <- c( exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2),
+          exp(beta0 + beta2 + beta1 + beta3),
+          exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2),
+          exp(beta0 + beta2 + beta1 + beta3) )
+
+cov12 <- cov_mat[
+  c("(Intercept)","InterventioniMAP","Time12M","InterventioniMAP:Time12M"),
+  c("(Intercept)","InterventioniMAP","Time12M","InterventioniMAP:Time12M")
+]
+
+var12  <- as.numeric(t(g12) %*% cov12 %*% g12)
+se12   <- sqrt(var12)
+
+CI12   <- RD12 + c(-1,1)*zcrit*se12
+Z12    <- RD12 / se12
+p12    <- 2 * pnorm(-abs(Z12))
+
+cat("12M Mean Difference (iMAP−SC):", RD12, "\n")
+cat("97.5% CI: (", CI12[1], ",", CI12[2], ")\n")
+cat("Wald Z:", Z12, "p-value:", p12, "\n")
+```
+
+
+```{r}
+model_cmp3_age_conditions_toMeds <- glmmTMB(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + Age + Conditions + Total_Meds + (1 | ID),
+  data      = data_long,
+  family    = compois(link = "log"),
+  dispformula = ~ Intervention*Time +baseline_MRP +race + site
+)
+```
+
+
+```{r}
+# Extract conditional fixed effects and covariance
+fixef_vals <- fixef(model_cmp3_age_conditions_toMeds)$cond
+cov_mat    <- vcov(model_cmp3_age_conditions_toMeds)$cond
+
+beta0 <- fixef_vals["(Intercept)"]
+beta1 <- fixef_vals["InterventioniMAP"]
+beta2 <- fixef_vals["Time12M"]
+beta3 <- fixef_vals["InterventioniMAP:Time12M"]
+
+# critical value for 97.5% two-sided CI
+zcrit <- qnorm(0.9875)
+
+### 6‐Month Mean Difference: Δ6 = E[MRP_iMAP,6] − E[MRP_SC,6]
+# E[MRP_iMAP,6]  = exp(beta0 + beta1)
+# E[MRP_SC,6]    = exp(beta0)
+RD6   <- exp(beta0 + beta1) - exp(beta0)
+
+# gradient vector: partial derivation (beta0,beta1)
+grad6 <- c( exp(beta0 + beta1) - exp(beta0),
+            exp(beta0 + beta1) )
+
+cov6  <- cov_mat[c("(Intercept)", "InterventioniMAP"),
+                 c("(Intercept)", "InterventioniMAP")]
+
+var6  <- as.numeric(t(grad6) %*% cov6 %*% grad6)
+se6   <- sqrt(var6)
+
+CI6   <- RD6 + c(-1,1)*zcrit*se6
+Z6    <- RD6 / se6
+p6    <- 2 * pnorm(-abs(Z6))
+
+cat("6M Mean Difference (iMAP−SC):", RD6, "\n")
+cat("97.5% CI: (", CI6[1], ",", CI6[2], ")\n")
+cat("Wald Z:", Z6, "p-value:", p6, "\n\n")
+
+### 12‐Month Mean Difference: Δ12 = E[MRP_iMAP,12] − E[MRP_SC,12]
+# E[MRP_iMAP,12] = exp(beta0+beta2+beta1+beta3)
+# E[MRP_SC,12]   = exp(beta0+beta2)
+RD12  <- exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2)
+
+# gradient vector for (beta0,beta1,beta2,beta3)
+g12 <- c( exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2),
+          exp(beta0 + beta2 + beta1 + beta3),
+          exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2),
+          exp(beta0 + beta2 + beta1 + beta3) )
+
+cov12 <- cov_mat[
+  c("(Intercept)","InterventioniMAP","Time12M","InterventioniMAP:Time12M"),
+  c("(Intercept)","InterventioniMAP","Time12M","InterventioniMAP:Time12M")
+]
+
+var12  <- as.numeric(t(g12) %*% cov12 %*% g12)
+se12   <- sqrt(var12)
+
+CI12   <- RD12 + c(-1,1)*zcrit*se12
+Z12    <- RD12 / se12
+p12    <- 2 * pnorm(-abs(Z12))
+
+cat("12M Mean Difference (iMAP−SC):", RD12, "\n")
+cat("97.5% CI: (", CI12[1], ",", CI12[2], ")\n")
+cat("Wald Z:", Z12, "p-value:", p12, "\n")
+```
+
+
+
+
+```{r}
+Imputed_data <- read_csv('imputed_data4-18.csv')
+```
+
+```{r}
+head(Imputed_data)
+```
+
+```{r}
+names(Imputed_data)
+```
+
+
+```{r}
+imputed_list <- split(Imputed_data, Imputed_data$`_Imputation_`) # get five imputed dataset
+# Apply the conversion function to each imputed dataset
+imputed_long_list <- lapply(imputed_list, convert_to_long)
+```
+
+
+```{r}
+imputed_long_list
+```
+
+
+
+
+
+
+```{r}
+library(lme4) 
+models_list_2 <- lapply(imputed_long_list, function(df) {
+  glmmTMB(
+    MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + (1 | ID),
+    data = df,
+    family = compois(link = "log"),
+    dispformula = ~ Intervention*Time +baseline_MRP +race + site
+  )
+})
+```
+
+```{r}
+# 5. Pool the results (conditional part) across imputations using Rubin’s rules.
+#    (a) Extract fixed-effect estimates (conditional part) from each model:
+est_list <- lapply(models_list_2, function(mod) {
+  fixef(mod)$cond  # returns a named numeric vector
+})
+
+# Convert the list of fixed-effects vectors to a matrix (columns = imputations)
+est_matrix <- do.call(cbind, est_list)
+# Set row names from the first imputed model (assume they are identical)
+pooled_est <- rowMeans(est_matrix)
+
+# (b) Extract the covariance matrices for each model's conditional part:
+cov_list <- lapply(models_list_2, function(mod) {
+  vcov(mod)$cond
+})
+
+# Compute the within-imputation variance:
+within_var <- Reduce("+", cov_list) / length(cov_list)
+
+# Number of imputations:
+m <- length(models_list_2)
+
+# Compute the between-imputation variance:
+between_var <- Reduce("+", lapply(est_list, function(est) {
+  (est - pooled_est) %*% t(est - pooled_est)
+})) / (m - 1)
+
+# Total variance using Rubin’s rules:
+total_var <- within_var + (1 + 1/m) * between_var
+pooled_se <- sqrt(diag(total_var))
+
+# Create a summary table for pooled fixed effects:
+pooled_results <- data.frame(
+  Parameter = names(pooled_est),
+  Estimate  = pooled_est,
+  SE        = pooled_se
+)
+print("Pooled Conditional Fixed Effects:")
+print(pooled_results)
+```
+
+
+
+```{r}
+# 6. (Optional) You may now use these pooled estimates to compute derived quantities.
+# For example, to test the mean difference at 6M and 12M:
+#
+# For 6M, assume that under reference conditions:
+#   Standard Care (SC) at 6M: log(mu_SC,6) = beta0  => mu_SC,6 = exp(beta0)
+#   iMAP at 6M:           log(mu_iMAP,6) = beta0 + beta1  => mu_iMAP,6 = exp(beta0 + beta1)
+#
+# Define the mean difference as:
+#   RD6 = E[MRP_iMAP,6] − E[MRP_SC,6] = exp(beta0 + beta1) − exp(beta0)
+#
+
+zcrit <- qnorm(0.9875)  # two-sided 97.5% alpha
+
+beta0 <- pooled_est["(Intercept)"]
+beta1 <- pooled_est["InterventioniMAP"]
+
+RD6 <- exp(beta0 + beta1) - exp(beta0)
+# Derivative w.r.t beta0 and beta1:
+grad_6 <- as.vector(c(exp(beta0 + beta1) - exp(beta0),
+                      exp(beta0 + beta1)))
+cov_6 <- total_var[c("(Intercept)", "InterventioniMAP"), c("(Intercept)", "InterventioniMAP")]
+var_RD6 <- as.numeric(t(grad_6) %*% cov_6 %*% grad_6)
+se_RD6 <- sqrt(var_RD6)
+CI6 <- RD6 + c(-1, 1)*zcrit*se_RD6
+Z6 <- RD6 / se_RD6
+p6 <- 2 * pnorm(-abs(Z6))
+
+cat("6M Mean Difference (MRP_iMAP - MRP_SC):", RD6, "\n")
+cat("97.5% CI for 6M Difference: (", CI6[1], ",", CI6[2], ")\n")
+cat("Wald Z at 6M:", Z6, "\n")
+cat("p-value at 6M:", p6, "\n\n")
+
+# For 12M, assuming:
+#   Standard Care at 12M: log(mu_SC,12) = beta0 + beta2  => mu_SC,12 = exp(beta0+beta2)
+#   iMAP at 12M:           log(mu_iMAP,12) = beta0 + beta2 + beta1 + beta3  => mu_iMAP,12 = exp(beta0+beta2+beta1+beta3)
+#
+# Mean difference at 12M:
+beta2 <- pooled_est["Time12M"]
+beta3 <- pooled_est["InterventioniMAP:Time12M"]
+
+RD12 <- exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2)
+grad_12 <- as.vector(c(
+  exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2),
+  exp(beta0 + beta2 + beta1 + beta3),
+  exp(beta0 + beta2 + beta1 + beta3) - exp(beta0 + beta2),
+  exp(beta0 + beta2 + beta1 + beta3)
+))
+cov_12 <- total_var[c("(Intercept)", "InterventioniMAP", "Time12M", "InterventioniMAP:Time12M"),
+                    c("(Intercept)", "InterventioniMAP", "Time12M", "InterventioniMAP:Time12M")]
+var_RD12 <- as.numeric(t(grad_12) %*% cov_12 %*% grad_12)
+se_RD12 <- sqrt(var_RD12)
+CI12 <- RD12 + c(-1, 1)*zcrit*se_RD12
+Z12 <- RD12 / se_RD12
+p12 <- 2 * pnorm(-abs(Z12))
+
+cat("12M Mean Difference (MRP_iMAP - MRP_SC):", RD12, "\n")
+cat("97.5% CI for 12M Difference: (", CI12[1], ",", CI12[2], ")\n")
+cat("Wald Z at 12M:", Z12, "\n")
+cat("p-value at 12M:", p12, "\n")
+```
+
+
+
+
+
+
