@@ -542,6 +542,18 @@ run;
 /***********************************
 Export Imputed Data
 ************************************/
+proc export data=imap1_data_clean
+    outfile="&pathname.cleaned_data.csv"
+    dbms=csv
+    replace;
+run;
+
+proc export data=imap1_data_clean2
+    outfile="&pathname.cleaned_data2.csv"
+    dbms=csv
+    replace;
+run;
+
 proc export data=imputed_data
     outfile="&pathname.imputed_data.csv"
     dbms=csv
