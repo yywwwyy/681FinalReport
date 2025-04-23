@@ -1,0 +1,284 @@
+---
+title: '4.11'
+author: "Chris Su"
+date: "2025-04-11"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(glmmTMB)
+imap1_data <- read_csv('/Users/jerrygao/Downloads/cleaned_data (1).csv')
+
+# 4. Inspect
+str(imap1_data)
+head(imap1_data)
+imap1_data <- as.data.frame(imap1_data)
+```
+```{r}
+convert_to_long <- function(df) {
+  # Step 3a: Extract baseline MRP (MRP_0) and rename it
+  baseline_df <- df %>%
+    select(ID, MRP_0) %>%
+    rename(baseline_MRP = MRP_0)
+  
+  # Step 3b: Pivot only the follow-up columns (MRP_6 and MRP_12) to long format
+  followup_data <- df %>%
+    pivot_longer(
+      cols = c(MRP_6, MRP_12),
+      names_to = "Time",
+      values_to = "MRP"
+    ) %>%
+    mutate(
+      Time = case_when(
+        Time == "MRP_6" ~ "6M",
+        Time == "MRP_12" ~ "12M"
+      ),
+      Time = factor(Time, levels = c("6M", "12M")),
+      Intervention = factor(Treatment, levels = c("Standard Care", "iMAP")),
+      race = factor(race),
+      #race = recode(race),
+      site = factor(site)
+    )
+  
+  # Step 3c: Join the baseline measurement to each follow-up row
+  data_long <- followup_data %>%
+    left_join(baseline_df, by = "ID")
+  
+  return(data_long)
+}
+```
+
+```{r}
+data_long <- convert_to_long(imap1_data)
+str(data_long)
+```
+
+
+primary analysis
+```{r}
+library(dplyr)
+library(lme4)
+library(DHARMa)
+
+```
+
+
+## poisson 
+```{r}
+model_poisson <- glmer(MRP ~ Intervention + Time + Intervention:Time + baseline_MRP +
+                         race + site + (1 | ID),
+                       data = data_long, family = poisson)
+summary(model_poisson)
+
+# 
+sim_poisson <- simulateResiduals(fittedModel = model_poisson)
+plot(sim_poisson)
+
+
+# 3. DHARMa diagnostics
+sim_poisson <- simulateResiduals(model_poisson)
+testDispersion(sim_poisson)
+```
+## NB
+```{r}
+model_nb <- glmmTMB(MRP ~ Intervention + Time + Intervention:Time + baseline_MRP +
+                    race + site + (1 | ID),
+                    data = data_long, family = nbinom2)
+
+# Make sure lme4 is installed and loaded
+library(lme4)
+
+# Fit the negative binomial model using glmer.nb
+model_nb_glmer <- glmer.nb(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP +
+    race + site + (1 | ID),
+  data = data_long
+)
+
+# Display the summary of the model
+summary(model_nb_glmer)
+
+
+# 3. Summarize the model
+summary(model_nb)
+
+# 4. Simulate residuals with DHARMa
+sim_nb <- simulateResiduals(fittedModel = model_nb, n = 1000)
+
+# 5. Plot the diagnostics
+plot(sim_nb)
+
+# 6. Test dispersion
+testDispersion(sim_nb)
+```
+
+## zero—inflated
+```{r}
+# 2. Fit the zero‑inflated Poisson GLMM
+model_zip_time <- glmmTMB(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + (1 | ID),
+  data      = data_long,
+  family    = poisson(link = "log"),
+  ziformula = ~ Intervention*Time +baseline_MRP +race + site      # zero‑inflation depends on Time
+)
+
+# 3. Summarize the model
+summary(model_zip_time)
+
+# 4. Simulate residuals via DHARMa
+sim_zip <- simulateResiduals(fittedModel = model_zip_time, n = 1000)
+
+# 5. Plot diagnostics
+plot(sim_zip)
+
+# 6. Test dispersion
+testDispersion(sim_zip)
+```
+
+## generalized poisson
+```{r}
+# 2. Fit the zero‑inflated Poisson GLMM
+model_gp <- glmmTMB(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + (1 | ID),
+  data      = data_long,
+  family    = genpois
+)
+
+# 3. Summarize the model
+summary(model_gp)
+
+# 4. Simulate residuals via DHARMa
+sim_zip <- simulateResiduals(fittedModel = model_gp, n = 1000)
+
+# 5. Plot diagnostics
+plot(sim_zip)
+
+# 6. Test dispersion
+testDispersion(sim_zip)
+```
+
+## CMP
+```{r}
+# 2. Fit the zero‑inflated Poisson GLMM
+model_cmp <- glmmTMB(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + (1 | ID),
+  data      = data_long,
+  family    = compois
+)
+
+# 3. Summarize the model
+summary(model_cmp)
+
+# 4. Simulate residuals via DHARMa
+sim_zip <- simulateResiduals(fittedModel = model_cmp, n = 1000)
+
+# 5. Plot diagnostics
+plot(sim_zip)
+
+# 6. Test dispersion
+testDispersion(sim_zip)
+```
+
+## quasi-possion
+```{r}
+library(MASS)    # for glmmPQL
+library(nlme)    # backend for glmmPQL
+library(DHARMa)
+
+# 2. Convert to plain data.frame for glmmPQL
+df_qp <- as.data.frame(data_long)
+
+# 3. Fit the quasi‐Poisson GLMM
+model_qp <- glmmPQL(
+  fixed   = MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site,
+  random  = ~ 1 | ID,
+  family  = quasipoisson(link = "log"),
+  data    = df_qp,
+  verbose = FALSE
+)
+
+# 4. Summarize the model
+summary(model_qp)
+
+# 5. Pearson‐based dispersion estimate (fixed)
+pearson_res <- residuals(model_qp, type = "pearson")
+
+# total obs
+n_obs <- model_qp$dims$N
+# number of fixed‑effect parameters (including intercept)
+p     <- length(coef(model_qp)$fixed)
+
+phi_hat <- sum(pearson_res^2) / (n_obs - p)
+cat("Quasi‐Poisson Pearson dispersion =", round(phi_hat, 3), "\n")
+
+```
+
+## quasi poisson plot
+```{r}
+library(ggplot2)
+
+# 1. Extract Pearson residuals and fitted values
+pearson_res <- residuals(model_qp, type = "pearson")
+fitted_vals <- fitted(model_qp)
+
+# 2. QQ‐plot of Pearson residuals
+qq_df <- data.frame(resid = pearson_res)
+p1 <- ggplot(qq_df, aes(sample = resid)) +
+  stat_qq() +
+  stat_qq_line() +
+  labs(
+    title = "QQ‐Plot of Pearson Residuals",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_minimal()
+
+# 3. Residuals vs. Fitted plot
+rvf_df <- data.frame(fitted = fitted_vals, resid = pearson_res)
+p2 <- ggplot(rvf_df, aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  stat_smooth(method = "loess", se = FALSE) +
+  labs(
+    title = "Residuals vs. Fitted Values",
+    x = "Fitted values",
+    y = "Pearson residuals"
+  ) +
+  theme_minimal()
+
+# 4. Print side by side
+library(patchwork)
+p1 | p2
+
+```
+
+## final model
+
+## CMP
+```{r}
+# 2. Fit the  Poisson GLMM
+model_cmp2 <- glmmTMB(
+  MRP ~ Intervention + Time + Intervention:Time + baseline_MRP + race + site + (1 | ID),
+  data      = data_long,
+  family    = compois(link = "log"),
+  dispformula = ~ Intervention*Time +baseline_MRP +race + site
+)
+
+# 3. Summarize the model
+summary(model_cmp2)
+
+# 4. Simulate residuals via DHARMa
+sim_zip2 <- simulateResiduals(fittedModel = model_cmp2, n = 1000)
+
+# 5. Plot diagnostics
+plot(sim_zip2)
+
+# 6. Test dispersion
+testDispersion(sim_zip2)
+```
