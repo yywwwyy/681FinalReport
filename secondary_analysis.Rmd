@@ -1,0 +1,824 @@
+---
+title: "681FINALPROJECT"
+author: "Kiara Zhang"
+date: "2025-04-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+library(tidyverse)
+library(lme4)
+# install.packages("broom.mixed")
+library(broom.mixed)
+library(emmeans)
+library(ggplot2)
+library(dplyr)
+
+```
+
+```{r}
+# load the data
+df <- read.csv("cleaned_data.csv")
+```
+
+```{r}
+# pivot the data longer
+# add a variable 'time' = (0,6,12)
+cols_to_convert <- c(
+  "MRP_0", "MRP_6", "MRP_12",
+  "Undertreat_0", "Undertreat_6", "Undertreat_12",
+  "Sub_dose_0", "Sub_dose_6", "Sub_dose_12",
+  "Med_Mon_0", "Med_Mon_6", "Med_Mon_12",
+  "Sub_drug_0", "Sub_drug_6", "Sub_drug_12",
+  "AE_0", "AE_6", "AE_12",
+  "NonAd_0", "NonAd_6", "NonAd_12"
+)
+
+long_df <- df %>%
+  pivot_longer(
+    cols = all_of(cols_to_convert),
+    names_to = c(".value", "time"),
+    names_pattern = "(.+)_(\\d+)$"
+  ) %>%
+  mutate(
+    time = as.numeric(time),
+    Treatment = factor(Treatment),
+    race = factor(race),
+    site = factor(site)
+  )
+
+# view the data
+glimpse(long_df)
+head(long_df)
+
+```
+
+```{r}
+# baseline as variables
+baseline_subtypes <- df %>%
+  select(ID, MRP_0, Undertreat_0, Sub_dose_0, Med_Mon_0, Sub_drug_0, AE_0, NonAd_0) %>%
+  distinct()
+
+long_df <- long_df %>%
+  left_join(baseline_subtypes, by = "ID")
+head(long_df)
+```
+
+## 8.4.1 Rate ratio of total MRPs (as a supplement to the primary analysis)
+```{r}
+# factor variables
+long_df_analysis <- long_df %>%
+  mutate(
+    time = factor(time, levels = c(0, 6, 12)),
+    Treatment = factor(Treatment, levels = c("Standard Care", "iMAP"))
+  )
+
+```
+
+```{r}
+# run poisson GLMM
+model_mrp_rr <- glmer(
+  MRP ~ Treatment * time + site + race + MRP_0 + (1 | ID),
+  data = long_df_analysis,
+  family = poisson(link = "log")
+)
+
+```
+
+```{r}
+# Extract fixed effect estimates from the fitted model
+coefs <- fixef(model_mrp_rr)
+
+# Extract the covariance matrix of fixed effects (for variance calculations)
+vcov_mat <- vcov(model_mrp_rr)
+
+# Get estimates of key coefficients
+# β1: main effect of iMAP at baseline (time = 0)
+# β4: interaction between iMAP and time = 6 months
+# β5: interaction between iMAP and time = 12 months
+beta1 <- coefs["TreatmentiMAP"]
+beta4 <- coefs["TreatmentiMAP:time6"]
+beta5 <- coefs["TreatmentiMAP:time12"]
+
+# Calculate rate ratios (RR) using the exponentiated sum of coefficients
+RR_6m <- exp(beta1 + beta4)
+RR_12m <- exp(beta1 + beta5)
+
+# --- Compute standard errors using the delta method ---
+# SE for (β1 + β4)
+se_6m <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time6", "TreatmentiMAP:time6"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time6"]
+)
+
+# SE for (β1 + β5)
+se_12m <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time12", "TreatmentiMAP:time12"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time12"]
+)
+
+# --- Compute 95% Confidence Intervals (CI) ---
+# CI = exp((β1 + βx) ± 1.96 * SE)
+CI_6m <- exp(c((beta1 + beta4) - 1.96 * se_6m,
+               (beta1 + beta4) + 1.96 * se_6m))
+
+CI_12m <- exp(c((beta1 + beta5) - 1.96 * se_12m,
+                (beta1 + beta5) + 1.96 * se_12m))
+
+# --- Compute Wald z statistics ---
+z_6m <- (beta1 + beta4) / se_6m
+z_12m <- (beta1 + beta5) / se_12m
+
+# --- Compute two-sided p-values for the Wald test ---
+p_6m <- 2 * (1 - pnorm(abs(z_6m)))
+p_12m <- 2 * (1 - pnorm(abs(z_12m)))
+
+# --- Output the results as a named list ---
+list(
+  RR_6m = RR_6m,
+  CI_6m = CI_6m,
+  z_6m = z_6m,
+  p_6m = p_6m,
+  
+  RR_12m = RR_12m,
+  CI_12m = CI_12m,
+  z_12m = z_12m,
+  p_12m = p_12m
+)
+```
+
+
+```{r}
+# Plot the result
+rr_data <- data.frame(
+  Time = c("6 Months", "12 Months"),
+  RR = c(0.8743, 0.7814),
+  CI_lower = c(0.7896, 0.7052),
+  CI_upper = c(0.9680, 0.8658)
+)
+
+ggplot(rr_data, aes(x = Time, y = RR)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, color = "gray40") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  ylim(0.6, 1.1) +
+  labs(
+    title = "Rate Ratio of Total MRPs (iMAP vs. Standard Care)",
+    y = "Rate Ratio (RR)", x = ""
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+
+To evaluate the impact of the iMAP intervention on the rate of total medication-related problems (MRPs), we fit a Poisson generalized linear mixed model adjusting for race, site, and baseline MRP count.
+
+At 6 months, participants in the iMAP group had a significantly lower rate of MRPs compared to those in the standard care group, with a rate ratio (RR) of 0.87 (95% CI: 0.79–0.97, p = 0.0097).
+
+At 12 months, the effect was even stronger, with the iMAP group showing a RR of 0.78 (95% CI: 0.71–0.87, p < 0.0001), indicating a 22% reduction in MRP rate relative to standard care.
+
+These results suggest that the iMAP intervention substantially reduced medication-related problems over time compared to standard care.
+
+## 8.4.2	Analysis of Secondary Outcome: Subgroup of MRPs
+
+```{r}
+#view the number of events of each subgroup
+df_sub <- long_df %>%
+  filter(time %in% c(6, 12))
+
+subgroups <- c("Undertreat", "Sub_dose", "Med_Mon", "Sub_drug", "AE", "NonAd")
+
+subgroup_counts <- sapply(subgroups, function(var) {
+  df_sub %>% filter(.data[[var]] == 1) %>% pull(ID) %>% unique() %>% length()
+})
+
+subgroup_counts_df <- data.frame(
+  Subgroup = names(subgroup_counts),
+  N_with_event = as.vector(subgroup_counts)
+)
+
+print(subgroup_counts_df)
+```
+
+### Suboptimal dosing modeling
+```{r}
+model_subdose <- glmer(
+  Sub_dose ~ Treatment * time + site + race + Sub_dose_0 + (1 | ID),
+  data = long_df_analysis,
+  family = binomial(link = "logit")
+)
+
+summary(model_subdose)
+```
+
+```{r}
+# Extract fixed effects (log-odds coefficients)
+coefs <- fixef(model_subdose)
+
+# Extract the variance-covariance matrix of fixed effects
+vcov_mat <- vcov(model_subdose)
+
+# --- Pull key coefficients ---
+# β1: main effect of iMAP at baseline
+beta1 <- coefs["TreatmentiMAP"]
+
+# β4: interaction of iMAP × time = 6 months
+beta4 <- coefs["TreatmentiMAP:time6"]
+
+# β5: interaction of iMAP × time = 12 months
+beta5 <- coefs["TreatmentiMAP:time12"]
+
+# --- Compute standard errors using the delta method ---
+# SE for (β1 + β4)
+se_6 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time6", "TreatmentiMAP:time6"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time6"]
+)
+
+# SE for (β1 + β5)
+se_12 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time12", "TreatmentiMAP:time12"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time12"]
+)
+
+# --- Calculate odds ratios (OR), 99% confidence intervals, Wald z-statistics, and p-values ---
+
+# OR and CI at 6 months
+or_6 <- exp(beta1 + beta4)
+ci_6 <- exp(c((beta1 + beta4) - 2.576 * se_6, (beta1 + beta4) + 2.576 * se_6))
+z_6 <- (beta1 + beta4) / se_6
+p_6 <- 2 * (1 - pnorm(abs(z_6)))
+
+# OR and CI at 12 months
+or_12 <- exp(beta1 + beta5)
+ci_12 <- exp(c((beta1 + beta5) - 2.576 * se_12, (beta1 + beta5) + 2.576 * se_12))
+z_12 <- (beta1 + beta5) / se_12
+p_12 <- 2 * (1 - pnorm(abs(z_12)))
+
+# --- Output the results as a named list ---
+list(
+  OR_6m = or_6,
+  CI_6m = ci_6,
+  z_6m = z_6,
+  p_6m = p_6,
+  
+  OR_12m = or_12,
+  CI_12m = ci_12,
+  z_12m = z_12,
+  p_12m = p_12
+)
+
+```
+
+```{r}
+# --- Create summary table ---
+result_table <- data.frame(
+  Time = c("6 months", "12 months"),
+  OR = c(or_6, or_12),
+  CI_Lower = c(ci_6[1], ci_12[1]),
+  CI_Upper = c(ci_6[2], ci_12[2]),
+  Wald_Z = c(z_6, z_12),
+  P_Value = c(p_6, p_12)
+)
+
+# Display table
+print(result_table)
+```
+
+```{r}
+library(ggplot2)
+
+plot_df <- data.frame(
+  Time = c("6 Months", "12 Months"),
+  OR = c(0.5876, 0.3733),
+  CI_lower = c(0.2868, 0.1734),
+  CI_upper = c(1.2038, 0.8037)
+)
+
+ggplot(plot_df, aes(x = Time, y = OR)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, color = "gray40") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  ylim(0, 1.3) +
+  labs(
+    title = "Odds Ratio of Suboptimal Dosing (iMAP vs. Standard Care)",
+    y = "Odds Ratio (99% CI)",
+    x = ""
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+### Medication monitoring needed modeling
+```{r}
+model_medmon <- glmer(
+  Med_Mon ~ Treatment * time + site + race + Med_Mon_0 + (1 | ID),
+  data = long_df_analysis,
+  family = binomial(link = "logit")
+)
+
+summary(model_medmon)
+```
+
+```{r}
+# Extract model coefficients (log-odds)
+coefs <- fixef(model_medmon)
+
+# Extract variance-covariance matrix for fixed effects
+vcov_mat <- vcov(model_medmon)
+
+# Get key coefficients
+# β₁: Main effect of iMAP at baseline
+beta1 <- coefs["TreatmentiMAP"]
+
+# β₄: Interaction (iMAP × time = 6)
+beta4 <- coefs["TreatmentiMAP:time6"]
+
+# β₅: Interaction (iMAP × time = 12)
+beta5 <- coefs["TreatmentiMAP:time12"]
+
+# Compute standard errors using delta method
+# SE for β₁ + β₄
+se_6 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time6", "TreatmentiMAP:time6"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time6"]
+)
+
+# SE for β₁ + β₅
+se_12 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time12", "TreatmentiMAP:time12"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time12"]
+)
+
+# Compute odds ratios (OR), 99% confidence intervals, z-values, and p-values
+
+# OR @ 6 months
+or_6 <- exp(beta1 + beta4)
+ci_6 <- exp(c((beta1 + beta4) - 2.576 * se_6, (beta1 + beta4) + 2.576 * se_6))
+z_6 <- (beta1 + beta4) / se_6
+p_6 <- 2 * (1 - pnorm(abs(z_6)))
+
+# OR @ 12 months
+or_12 <- exp(beta1 + beta5)
+ci_12 <- exp(c((beta1 + beta5) - 2.576 * se_12, (beta1 + beta5) + 2.576 * se_12))
+z_12 <- (beta1 + beta5) / se_12
+p_12 <- 2 * (1 - pnorm(abs(z_12)))
+
+# Output the results
+list(
+  OR_6m = or_6,
+  CI_6m = ci_6,
+  z_6m = z_6,
+  p_6m = p_6,
+  
+  OR_12m = or_12,
+  CI_12m = ci_12,
+  z_12m = z_12,
+  p_12m = p_12
+)
+
+```
+```{r}
+# --- Create summary table ---
+result_table <- data.frame(
+  Time = c("6 months", "12 months"),
+  OR = c(or_6, or_12),
+  CI_Lower = c(ci_6[1], ci_12[1]),
+  CI_Upper = c(ci_6[2], ci_12[2]),
+  Wald_Z = c(z_6, z_12),
+  P_Value = c(p_6, p_12)
+)
+
+# Display table
+print(result_table)
+```
+
+```{r}
+# Input the OR and 99% CI values for iMAP vs SC
+plot_df <- data.frame(
+  Time = c("6 Months", "12 Months"),
+  OR = c(0.9715561, 0.8608350),
+  CI_lower = c(0.4917639, 0.4157322),
+  CI_upper = c(1.919460, 1.782486)
+)
+
+# Create the plot
+ggplot(plot_df, aes(x = Time, y = OR)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, color = "gray40") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  ylim(0, 2.0) +
+  labs(
+    title = "Odds Ratio of Medication Monitoring Needed (iMAP vs. Standard Care)",
+    y = "Odds Ratio (99% CI)",
+    x = ""
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
+
+### Suboptimal drug modeling
+
+```{r}
+# Sub_drug: GLMM with logit link
+model_subdrug <- glmer(
+  Sub_drug ~ Treatment * time + site + race + Sub_drug_0 + (1 | ID),
+  data = long_df_analysis,
+  family = binomial(link = "logit")
+)
+
+summary(model_subdrug)
+
+
+```
+
+```{r}
+# Extract fixed effects and variance-covariance matrix
+coefs <- fixef(model_subdrug)
+vcov_mat <- vcov(model_subdrug)
+
+# Coefficients for interaction
+beta1 <- coefs["TreatmentiMAP"]
+beta4 <- coefs["TreatmentiMAP:time6"]
+beta5 <- coefs["TreatmentiMAP:time12"]
+
+# Standard errors using delta method
+se_6 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time6", "TreatmentiMAP:time6"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time6"]
+)
+
+se_12 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time12", "TreatmentiMAP:time12"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time12"]
+)
+
+# OR and 99% CI at 6 months
+or_6 <- exp(beta1 + beta4)
+ci_6 <- exp(c((beta1 + beta4) - 2.576 * se_6, (beta1 + beta4) + 2.576 * se_6))
+z_6 <- (beta1 + beta4) / se_6
+p_6 <- 2 * (1 - pnorm(abs(z_6)))
+
+# OR and 99% CI at 12 months
+or_12 <- exp(beta1 + beta5)
+ci_12 <- exp(c((beta1 + beta5) - 2.576 * se_12, (beta1 + beta5) + 2.576 * se_12))
+z_12 <- (beta1 + beta5) / se_12
+p_12 <- 2 * (1 - pnorm(abs(z_12)))
+
+# Output results
+list(
+  OR_6m = or_6, CI_6m = ci_6, z_6m = z_6, p_6m = p_6,
+  OR_12m = or_12, CI_12m = ci_12, z_12m = z_12, p_12m = p_12
+)
+
+```
+
+```{r}
+# --- Create summary table ---
+result_table <- data.frame(
+  Time = c("6 months", "12 months"),
+  OR = c(or_6, or_12),
+  CI_Lower = c(ci_6[1], ci_12[1]),
+  CI_Upper = c(ci_6[2], ci_12[2]),
+  Wald_Z = c(z_6, z_12),
+  P_Value = c(p_6, p_12)
+)
+
+# Display table
+print(result_table)
+```
+
+```{r}
+# Updated OR and 99% CI values from output
+plot_df <- data.frame(
+  Time = c("6 Months", "12 Months"),
+  OR = c(1.0183309, 0.5868606),
+  CI_lower = c(0.4874686, 0.2777750),
+  CI_upper = c(2.127312, 1.239872)
+)
+
+# Plot
+ggplot(plot_df, aes(x = Time, y = OR)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, color = "gray40") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  ylim(0, 2.3) +
+  labs(
+    title = "Odds Ratio of Suboptimal Drug Choice (iMAP vs. Standard Care)",
+    y = "Odds Ratio (99% CI)",
+    x = ""
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+```
+
+
+
+
+### Undertreat modeling
+```{r}
+# GLMM with logit link
+model_under <- glmer(
+  Undertreat ~ Treatment * time + site + race + Undertreat_0 + (1 | ID),
+  data = long_df_analysis,
+  family = binomial(link = "logit")
+)
+
+summary(model_under)
+```
+
+
+```{r}
+coefs <- fixef(model_under)
+vcov_mat <- vcov(model_under)
+
+beta1 <- coefs["TreatmentiMAP"]
+beta4 <- coefs["TreatmentiMAP:time6"]
+beta5 <- coefs["TreatmentiMAP:time12"]
+
+se_6 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time6", "TreatmentiMAP:time6"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time6"]
+)
+
+se_12 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time12", "TreatmentiMAP:time12"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time12"]
+)
+
+
+# Compute OR, 99% CI, z-value, and p-value for 6 and 12 months
+# 6 months
+or_6 <- exp(beta1 + beta4)
+ci_6 <- exp(c((beta1 + beta4) - 2.576 * se_6, (beta1 + beta4) + 2.576 * se_6))
+z_6 <- (beta1 + beta4) / se_6
+p_6 <- 2 * (1 - pnorm(abs(z_6)))
+
+# 12 months
+or_12 <- exp(beta1 + beta5)
+ci_12 <- exp(c((beta1 + beta5) - 2.576 * se_12, (beta1 + beta5) + 2.576 * se_12))
+z_12 <- (beta1 + beta5) / se_12
+p_12 <- 2 * (1 - pnorm(abs(z_12)))
+
+
+list(
+  OR_6m = or_6, CI_6m = ci_6, z_6m = z_6, p_6m = p_6,
+  OR_12m = or_12, CI_12m = ci_12, z_12m = z_12, p_12m = p_12
+)
+
+```
+
+```{r}
+# --- Create summary table ---
+result_table <- data.frame(
+  Time = c("6 months", "12 months"),
+  OR = c(or_6, or_12),
+  CI_Lower = c(ci_6[1], ci_12[1]),
+  CI_Upper = c(ci_6[2], ci_12[2]),
+  Wald_Z = c(z_6, z_12),
+  P_Value = c(p_6, p_12)
+)
+
+# Display table
+print(result_table)
+```
+
+
+```{r}
+# Input OR and 99% CI values from the latest output
+plot_df <- data.frame(
+  Time = c("6 Months", "12 Months"),
+  OR = c(0.5458593, 0.5059454),
+  CI_lower = c(0.2624432, 0.2319192),
+  CI_upper = c(1.135340, 1.103749)
+)
+
+# Plot forest plot
+ggplot(plot_df, aes(x = Time, y = OR)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, color = "gray40") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  ylim(0, 1.2) +
+  labs(
+    title = "Odds Ratio of Undertreatment (iMAP vs. Standard Care)",
+    y = "Odds Ratio (99% CI)",
+    x = ""
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+
+
+# Adverse Drug Event Modeling
+
+```{r}
+model_ae <- glmer(
+  AE ~ Treatment * time + site + race + AE_0 + (1 | ID),
+  data = long_df_analysis,
+  family = binomial(link = "logit")
+)
+
+summary(model_ae)
+```
+
+```{r}
+coefs <- fixef(model_ae)
+vcov_mat <- vcov(model_ae)
+
+beta1 <- coefs["TreatmentiMAP"]
+beta4 <- coefs["TreatmentiMAP:time6"]
+beta5 <- coefs["TreatmentiMAP:time12"]
+
+
+se_6 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time6", "TreatmentiMAP:time6"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time6"]
+)
+
+se_12 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time12", "TreatmentiMAP:time12"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time12"]
+)
+
+
+# Compute OR, 99% CI, z-value, and p-value for 6 and 12 months
+# 6 months
+or_6 <- exp(beta1 + beta4)
+ci_6 <- exp(c((beta1 + beta4) - 2.576 * se_6, (beta1 + beta4) + 2.576 * se_6))
+z_6 <- (beta1 + beta4) / se_6
+p_6 <- 2 * (1 - pnorm(abs(z_6)))
+
+# 12 months
+or_12 <- exp(beta1 + beta5)
+ci_12 <- exp(c((beta1 + beta5) - 2.576 * se_12, (beta1 + beta5) + 2.576 * se_12))
+z_12 <- (beta1 + beta5) / se_12
+p_12 <- 2 * (1 - pnorm(abs(z_12)))
+
+list(
+  OR_6m = or_6, CI_6m = ci_6, z_6m = z_6, p_6m = p_6,
+  OR_12m = or_12, CI_12m = ci_12, z_12m = z_12, p_12m = p_12
+)
+
+```
+
+```{r}
+# --- Create summary table ---
+result_table <- data.frame(
+  Time = c("6 months", "12 months"),
+  OR = c(or_6, or_12),
+  CI_Lower = c(ci_6[1], ci_12[1]),
+  CI_Upper = c(ci_6[2], ci_12[2]),
+  Wald_Z = c(z_6, z_12),
+  P_Value = c(p_6, p_12)
+)
+
+# Display table
+print(result_table)
+```
+
+```{r}
+# Updated OR and 99% CI values from output
+plot_df <- data.frame(
+  Time = c("6 Months", "12 Months"),
+  OR = c(1.684668, 0.562770),
+  CI_lower = c(0.4597227, 0.1480401),
+  CI_upper = c(6.173518, 2.139353)
+)
+
+ggplot(plot_df, aes(x = Time, y = OR)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, color = "gray40") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  ylim(0, 6.5) +
+  labs(
+    title = "Odds Ratio of Adverse Drug Events (iMAP vs. Standard Care)",
+    y = "Odds Ratio (99% CI)",
+    x = ""
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+
+### Nonadherence modeling
+```{r}
+model_nonad <- glmer(
+  NonAd ~ Treatment * time + site + race + NonAd_0 + (1 | ID),
+  data = long_df_analysis,
+  family = binomial(link = "logit")
+)
+
+
+summary(model_nonad)
+```
+
+```{r}
+coefs <- fixef(model_nonad)
+vcov_mat <- vcov(model_nonad)
+
+
+beta1 <- coefs["TreatmentiMAP"]
+beta4 <- coefs["TreatmentiMAP:time6"]
+beta5 <- coefs["TreatmentiMAP:time12"]
+
+se_6 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time6", "TreatmentiMAP:time6"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time6"]
+)
+
+se_12 <- sqrt(
+  vcov_mat["TreatmentiMAP", "TreatmentiMAP"] +
+  vcov_mat["TreatmentiMAP:time12", "TreatmentiMAP:time12"] +
+  2 * vcov_mat["TreatmentiMAP", "TreatmentiMAP:time12"]
+)
+
+# Compute OR, 99% CI, z-value, and p-value for 6 and 12 months
+# 6 months
+or_6 <- exp(beta1 + beta4)
+ci_6 <- exp(c((beta1 + beta4) - 2.576 * se_6, (beta1 + beta4) + 2.576 * se_6))
+z_6 <- (beta1 + beta4) / se_6
+p_6 <- 2 * (1 - pnorm(abs(z_6)))
+
+# 12 months
+or_12 <- exp(beta1 + beta5)
+ci_12 <- exp(c((beta1 + beta5) - 2.576 * se_12, (beta1 + beta5) + 2.576 * se_12))
+z_12 <- (beta1 + beta5) / se_12
+p_12 <- 2 * (1 - pnorm(abs(z_12)))
+
+list(
+  OR_6m = or_6, CI_6m = ci_6, z_6m = z_6, p_6m = p_6,
+  OR_12m = or_12, CI_12m = ci_12, z_12m = z_12, p_12m = p_12
+)
+```
+
+```{r}
+# --- Create summary table ---
+result_table <- data.frame(
+  Time = c("6 months", "12 months"),
+  OR = c(or_6, or_12),
+  CI_Lower = c(ci_6[1], ci_12[1]),
+  CI_Upper = c(ci_6[2], ci_12[2]),
+  Wald_Z = c(z_6, z_12),
+  P_Value = c(p_6, p_12)
+)
+
+# Display table
+print(result_table)
+```
+
+```{r}
+# Updated OR and 99% CI values for Nonadherence
+plot_df <- data.frame(
+  Time = c("6 Months", "12 Months"),
+  OR = c(0.9716208, 1.3834279),
+  CI_lower = c(0.3320951, 0.4030767),
+  CI_upper = c(2.842700, 4.748160)
+)
+
+ggplot(plot_df, aes(x = Time, y = OR)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper),
+                width = 0.2, color = "gray40") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  ylim(0, 5) +
+  labs(
+    title = "Odds Ratio of Nonadherence (iMAP vs. Standard Care)",
+    y = "Odds Ratio (99% CI)",
+    x = ""
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
