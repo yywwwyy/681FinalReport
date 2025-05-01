@@ -15,8 +15,8 @@ Below is a summary of file purposes and data flow.
 
 
 ## Modeling and Analysis
-| File                      | Input                     | Output                  |
-|--------------------------|---------------------------|-------------------------|
+| File                      | Input                     |
+|--------------------------|---------------------------|
 | `model selection-681.Rmd` | `cleaned_data.csv`     |
 | `Primary Analysis4-18.Rmd` | `cleaned_data.csv`     | 
 | `secondary_analysis.R`  | `cleaned_data.csv`       | 
